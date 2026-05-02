@@ -1,0 +1,33 @@
+{
+    "compilerOptions": {
+        "target": "ESNext",
+        "module": "commonjs",
+        "rootDir": "./src/",
+        "outDir": "./dist/",
+        "strict": true,
+        "moduleResolution": "node",
+        "experimentalDecorators": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "allowSyntheticDefaultImports": true,
+        "resolveJsonModule": true,
+        "forceConsistentCasingInFileNames": true,
+        "removeComments": true,
+        "sourceMap": true,
+        "baseUrl": "./"
+    },
+    "files": [
+        "src/railwaybot.ts",
+        "src/store.ts",
+        "src/incidents.ts",
+        "src/commands.ts",
+        "src/types.ts"
+    ],
+    "include": [
+        "./**/*.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "dist"
+    ]
+}

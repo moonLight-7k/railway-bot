@@ -1,0 +1,32 @@
+{
+  "name": "railwaybot",
+  "version": "1.0.0",
+  "description": "A companion bot to railway.app, offering everything from usage reports to notifications of all kind",
+  "main": "dist/railwaybot.js",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "start": "node ./dist/railwaybot.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "cors": "^2.8.6",
+    "discord.js": "^14.26.4",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "graphql": "^16.11.0",
+    "graphql-request": "^7.4.0",
+    "node-cron": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.12.2",
+    "typescript": "^5.9.3"
+  }
+}

@@ -7,7 +7,7 @@
 
 A Discord bot for Railway deploy alerts, incident tracking, routing, and daily summaries.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/NXe61K?referralCode=NSNGgG&utm_medium=integration&utm_source=template&utm_campaign=generic)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/wide-wild?referralCode=NSNGgG&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
 [Repository](https://github.com/moonLight-7k/railway-bot) • [Issues](https://github.com/moonLight-7k/railway-bot/issues) • [Docs](./docs/README.md)
 </div>

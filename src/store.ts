@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import { mkdirSync } from 'fs';
+import { logger, logError } from './logger';
 
 const DB_PATH = process.env.DB_PATH ?? path.join(process.cwd(), 'data', 'railwaybot.db');
 
@@ -8,12 +9,17 @@ let _db: Database.Database | null = null;
 
 export function getDb(): Database.Database {
     if (_db) return _db;
-    mkdirSync(path.dirname(DB_PATH), { recursive: true });
-    _db = new Database(DB_PATH);
-    _db.pragma('journal_mode = WAL');
-    _db.pragma('foreign_keys = ON');
-    migrate(_db);
-    return _db;
+    try {
+        mkdirSync(path.dirname(DB_PATH), { recursive: true });
+        _db = new Database(DB_PATH);
+        _db.pragma('journal_mode = WAL');
+        _db.pragma('foreign_keys = ON');
+        migrate(_db);
+        return _db;
+    } catch (err) {
+        logError(err as Error, { event: 'database_init_failure', path: DB_PATH });
+        throw new Error(`Failed to initialize database: ${(err as Error).message}`);
+    }
 }
 
 export function closeDb() {
@@ -85,6 +91,22 @@ function migrate(db: Database.Database) {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS monitored_services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            service_id TEXT NOT NULL,
+            service_name TEXT NOT NULL,
+            environment_id TEXT NOT NULL,
+            environment_name TEXT NOT NULL,
+            last_known_status TEXT,
+            last_deployment_id TEXT,
+            last_log_alert_at TEXT,
+            last_checked_at TEXT,
+            added_by TEXT,
+            UNIQUE(service_id, environment_id)
+        );
     `);
 }
 
@@ -132,6 +154,21 @@ export interface AlertRouteRow {
     channel_id: string;
 }
 
+export interface MonitoredServiceRow {
+    id: number;
+    project_id: string;
+    project_name: string;
+    service_id: string;
+    service_name: string;
+    environment_id: string;
+    environment_name: string;
+    last_known_status: string | null;
+    last_deployment_id: string | null;
+    last_log_alert_at: string | null;
+    last_checked_at: string | null;
+    added_by: string | null;
+}
+
 interface StmtMap {
     upsertIncident: Database.Statement;
     findByFingerprint: Database.Statement;
@@ -157,6 +194,11 @@ interface StmtMap {
     resolveOldIncidents: Database.Statement;
     getAppState: Database.Statement;
     setAppState: Database.Statement;
+    insertMonitoredService: Database.Statement;
+    deleteMonitoredService: Database.Statement;
+    listMonitoredServices: Database.Statement;
+    updateMonitoredServiceStatus: Database.Statement;
+    updateMonitoredServiceLogAlert: Database.Statement;
 }
 
 let stmts: Partial<StmtMap> = {};
@@ -251,6 +293,22 @@ export function prepareStatements() {
         setAppState: db.prepare(`
             INSERT INTO app_state (key, value) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `),
+        insertMonitoredService: db.prepare(`
+            INSERT OR IGNORE INTO monitored_services (project_id, project_name, service_id, service_name, environment_id, environment_name, added_by)
+            VALUES (@projectId, @projectName, @serviceId, @serviceName, @environmentId, @environmentName, @addedBy)
+        `),
+        deleteMonitoredService: db.prepare(`
+            DELETE FROM monitored_services WHERE id = ?
+        `),
+        listMonitoredServices: db.prepare(`
+            SELECT * FROM monitored_services ORDER BY project_name, service_name
+        `),
+        updateMonitoredServiceStatus: db.prepare(`
+            UPDATE monitored_services SET last_known_status = ?, last_deployment_id = ?, last_checked_at = ? WHERE id = ?
+        `),
+        updateMonitoredServiceLogAlert: db.prepare(`
+            UPDATE monitored_services SET last_log_alert_at = ? WHERE id = ?
         `),
     };
 }
@@ -363,5 +421,28 @@ export const db = {
 
     setAppState(key: string, value: string) {
         s('setAppState').run(key, value);
+    },
+
+    insertMonitoredService(params: {
+        projectId: string; projectName: string; serviceId: string; serviceName: string;
+        environmentId: string; environmentName: string; addedBy: string | null;
+    }): number {
+        return s('insertMonitoredService').run(params).changes;
+    },
+
+    deleteMonitoredService(id: number) {
+        s('deleteMonitoredService').run(id);
+    },
+
+    listMonitoredServices(): MonitoredServiceRow[] {
+        return s('listMonitoredServices').all() as MonitoredServiceRow[];
+    },
+
+    updateMonitoredServiceStatus(id: number, status: string | null, deploymentId: string | null, checkedAt: string) {
+        s('updateMonitoredServiceStatus').run(status, deploymentId, checkedAt, id);
+    },
+
+    updateMonitoredServiceLogAlert(id: number, alertAt: string) {
+        s('updateMonitoredServiceLogAlert').run(alertAt, id);
     },
 };

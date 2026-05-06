@@ -36,6 +36,9 @@ bower_components
 .DS_Store
 Thumbs.db
 
+# Serena
+.serena/
+
 # Ignore built ts files
 dist/**/*
 

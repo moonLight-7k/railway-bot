@@ -5,10 +5,12 @@ import { Client, EmbedBuilder, GatewayIntentBits, TextChannel } from 'discord.js
 import express, { Request, Response } from 'express';
 import { gql, GraphQLClient } from 'graphql-request';
 import cron from 'node-cron';
+import pRetry from 'p-retry';
 import { closeDb, prepareStatements, db as storeDb } from './store';
 import { processDeployEvent, autoResolveStale, cleanupOldDeploys } from './incidents';
 import { registerCommands, setupInteractions, postIncidentToDiscord, sendDailyDigest } from './commands';
 import { type Measurement, type WebhookBody, isValidWebhookBody, isSuccessStatus, isFailureStatus } from './types';
+import { logger, logError, formatErrorForDiscord, redactSensitive } from './logger';
 
 const RAILWAY_ENDPOINT = process.env.RAILWAY_ENDPOINT ?? 'https://backboard.railway.com/graphql/v2';
 const PORT = process.env.PORT || 3000;
@@ -22,6 +24,9 @@ const WORKSPACE_ID = process.env.WORKSPACE_ID;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET ?? '';
 const DIGEST_HOUR = parseInt(process.env.DIGEST_HOUR ?? '9', 10);
 const USAGE_CRON = process.env.USAGE_CRON ?? '0 9 * * *';
+const MONITOR_CRON = process.env.MONITOR_CRON ?? '*/5 * * * *';
+const MONITOR_LOG_PATTERNS = (process.env.MONITOR_LOG_PATTERNS ?? 'ERROR,FATAL,PANIC,Uncaught,unhandledRejection,Exception,SIGKILL,OOMKilled').split(',').map(p => p.trim()).filter(Boolean);
+const MONITOR_LOG_COOLDOWN_MS = parseInt(process.env.MONITOR_LOG_COOLDOWN ?? '30', 10) * 60_000;
 const DAILY_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const USAGE_LAST_SENT_KEY = 'usage:last_sent_at';
 const HEARTBEAT_LAST_SENT_KEY = 'heartbeat:last_sent_at';
@@ -39,7 +44,12 @@ app.use(express.json({ verify: (req: any, _res, buf) => { req.rawBody = buf.toSt
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const graphQLClient = new GraphQLClient(RAILWAY_ENDPOINT, {
-    headers: { Authorization: `Bearer ${RAILWAY_API_KEY}` },
+  headers: {
+    Authorization: `Bearer ${RAILWAY_API_KEY}`,
+    'Content-Type': 'application/json',
+  },
+  timeout: 10_000, // 10s timeout
+  errorPolicy: 'all', // Return errors alongside data
 });
 
 const projectsQuery = gql`
@@ -61,6 +71,32 @@ query projectUsage($projectId: String!) {
     estimatedValue
     measurement
     projectId
+  }
+}
+`;
+
+const deploymentsQuery = gql`
+query deployments($input: DeploymentListInput!) {
+  deployments(input: $input, first: 1) {
+    edges {
+      node {
+        id
+        status
+        createdAt
+      }
+    }
+  }
+}
+`;
+
+const deploymentLogsQuery = gql`
+query deploymentLogs($deploymentId: String!) {
+  deploymentLogs(deploymentId: $deploymentId, limit: 100) {
+    ... on DeploymentLog {
+      message
+      timestamp
+      severity
+    }
   }
 }
 `;
@@ -95,6 +131,17 @@ cron.schedule(USAGE_CRON, async () => {
 cron.schedule(`0 ${DIGEST_HOUR} * * *`, async () => {
     if (USAGE_CHANNEL_ID) {
         await sendDailyDigest(client, USAGE_CHANNEL_ID);
+    }
+});
+
+let monitoringInProgress = false;
+cron.schedule(MONITOR_CRON, async () => {
+    if (monitoringInProgress) return;
+    monitoringInProgress = true;
+    try {
+        await runMonitoringCycle();
+    } finally {
+        monitoringInProgress = false;
     }
 });
 
@@ -156,8 +203,25 @@ async function reportUsage() {
     try {
         if (!WORKSPACE_ID) return;
 
-        const projectsResult = await graphQLClient.request<{ projects: { edges: Array<{ node: { id: string; name: string } }> } }>(
-            projectsQuery, { workspaceId: WORKSPACE_ID }
+        const projectsResult = await pRetry(
+            async () => {
+                try {
+                    return await graphQLClient.request<{ projects: { edges: Array<{ node: { id: string; name: string } }> } }>(
+                        projectsQuery, { workspaceId: WORKSPACE_ID }
+                    );
+                } catch (err) {
+                    logError(err as Error, { event: 'railway_api_failure', workspaceId: WORKSPACE_ID });
+                    throw new pRetry.AbortError((err as Error).message);
+                }
+            },
+            {
+                retries: 3,
+                minTimeout: 1000,
+                maxTimeout: 5000,
+                onFailedAttempt: (error) => {
+                    logger.warn(`Attempt ${error.attemptNumber} failed for workspace ${WORKSPACE_ID}. Retrying...`);
+                },
+            }
         );
 
         const usageChannel = await fetchTextChannel(USAGE_CHANNEL_ID, 'USAGE_CHANNEL');
@@ -165,18 +229,34 @@ async function reportUsage() {
 
         for (const { node } of projectsResult.projects.edges) {
             try {
-                const result = await graphQLClient.request<{
-                    usage: Array<{ value: number; measurement: Measurement; tags: { projectId: string } }>;
-                    estimatedUsage: Array<{ estimatedValue: number; measurement: Measurement; projectId: string }>;
-                }>(projectUsageQuery, { projectId: node.id });
+                const result = await pRetry(
+                    async () => {
+                        try {
+                            return await graphQLClient.request<{
+                                usage: Array<{ value: number; measurement: Measurement; tags: { projectId: string } }>;
+                                estimatedUsage: Array<{ estimatedValue: number; measurement: Measurement; projectId: string }>;
+                            }>(projectUsageQuery, { projectId: node.id });
+                        } catch (err) {
+                            logError(err as Error, { event: 'railway_api_failure', projectId: node.id, projectName: node.name });
+                            throw new pRetry.AbortError((err as Error).message);
+                        }
+                    },
+                    {
+                        retries: 3,
+                        minTimeout: 1000,
+                        maxTimeout: 5000,
+                        onFailedAttempt: (error) => {
+                            logger.warn(`Attempt ${error.attemptNumber} failed for project ${node.name}. Retrying...`);
+                        },
+                    }
+                );
 
                 const project = buildSingleProjectUsage(node, result);
                 if (project) {
                     await usageChannel.send({ embeds: [buildUsageEmbed(project)] });
                 }
             } catch (err) {
-                console.error(`Usage query failed for project ${node.name}:`, err);
-                await logError(`Usage query failed for project ${node.name}:\n${formatError(err)}`);
+                logError(err as Error, { event: 'usage_report_failure', projectId: node.id, projectName: node.name });
             }
         }
 
@@ -284,6 +364,131 @@ function calculateCost(cpu: number, mem: number, egress: number) {
     return cpu * CPU_COST_PER_UNIT + mem * MEM_COST_PER_UNIT + egress * EGRESS_COST_PER_UNIT;
 }
 
+async function runMonitoringCycle() {
+    const services = storeDb.listMonitoredServices();
+    if (services.length === 0) return;
+
+    for (const svc of services) {
+        try {
+            const result = await pRetry(
+                async () => graphQLClient.request<{
+                    deployments: { edges: Array<{ node: { id: string; status: string; createdAt: string } }> };
+                }>(deploymentsQuery, {
+                    input: { projectId: svc.project_id, serviceId: svc.service_id, environmentId: svc.environment_id },
+                }),
+                { retries: 2, minTimeout: 1000, maxTimeout: 3000 }
+            );
+
+            const latest = result.deployments.edges[0]?.node;
+            if (!latest) {
+                storeDb.updateMonitoredServiceStatus(svc.id, null, null, new Date().toISOString());
+                continue;
+            }
+
+            const statusChanged = latest.status !== svc.last_known_status;
+            const deploymentChanged = latest.id !== svc.last_deployment_id;
+
+            if (!statusChanged && !deploymentChanged) {
+                storeDb.updateMonitoredServiceStatus(svc.id, latest.status, latest.id, new Date().toISOString());
+                continue;
+            }
+
+            if (isFailureStatus(latest.status)) {
+                const event = processDeployEvent({
+                    projectId: svc.project_id,
+                    projectName: svc.project_name,
+                    serviceId: svc.service_id,
+                    serviceName: svc.service_name,
+                    environment: svc.environment_name,
+                    status: latest.status,
+                    commitAuthor: null,
+                    commitMessage: null,
+                    deploymentId: latest.id,
+                }, INCIDENT_CHANNEL_ID);
+
+                if (event) {
+                    const incident = storeDb.findIncidentById(event.incidentId);
+                    if (incident) {
+                        await postIncidentToDiscord(client, event, incident);
+                    }
+                }
+            } else if (isSuccessStatus(latest.status)) {
+                processDeployEvent({
+                    projectId: svc.project_id,
+                    projectName: svc.project_name,
+                    serviceId: svc.service_id,
+                    serviceName: svc.service_name,
+                    environment: svc.environment_name,
+                    status: latest.status,
+                    commitAuthor: null,
+                    commitMessage: null,
+                    deploymentId: latest.id,
+                }, INCIDENT_CHANNEL_ID);
+            }
+
+            storeDb.updateMonitoredServiceStatus(svc.id, latest.status, latest.id, new Date().toISOString());
+
+            if (isSuccessStatus(latest.status)) {
+                await scanDeploymentLogs(svc, latest.id);
+            }
+        } catch (err) {
+            logError(err as Error, { event: 'monitor_cycle_failure', serviceId: svc.service_id, serviceName: svc.service_name });
+        }
+    }
+}
+
+async function scanDeploymentLogs(svc: import('./store').MonitoredServiceRow, deploymentId: string) {
+    if (MONITOR_LOG_PATTERNS.length === 0) return;
+
+    if (svc.last_log_alert_at) {
+        const elapsed = Date.now() - Date.parse(svc.last_log_alert_at);
+        if (!Number.isNaN(elapsed) && elapsed < MONITOR_LOG_COOLDOWN_MS) return;
+    }
+
+    try {
+        const result = await pRetry(
+            async () => graphQLClient.request<{
+                deploymentLogs: Array<{ message: string; timestamp: string; severity: string }>;
+            }>(deploymentLogsQuery, { deploymentId }),
+            { retries: 1, minTimeout: 1000, maxTimeout: 3000 }
+        );
+
+        type LogEntry = { message: string; timestamp: string; severity: string };
+        const logs: LogEntry[] = result.deploymentLogs ?? [];
+        const errorLogs = logs.filter((log: LogEntry) =>
+            MONITOR_LOG_PATTERNS.some(pattern => log.message.toLowerCase().includes(pattern.toLowerCase()))
+        );
+
+        if (errorLogs.length === 0) return;
+
+        const channelId = INCIDENT_CHANNEL_ID || LOG_CHANNEL_ID;
+        if (!channelId) return;
+
+        const channel = await fetchTextChannel(channelId, 'INCIDENT_CHANNEL');
+        const sample = errorLogs.slice(0, 5).map((l: LogEntry) => `\`${l.message.slice(0, 200)}\``).join('\n');
+
+        const embed = new EmbedBuilder()
+            .setTitle('\u{1F4CB} Runtime Log Errors Detected')
+            .setDescription([
+                `**Project:** ${svc.project_name}`,
+                `**Service:** ${svc.service_name}`,
+                `**Environment:** ${svc.environment_name}`,
+                `**Matching lines:** ${errorLogs.length}`,
+                '',
+                '**Sample:**',
+                sample,
+            ].join('\n'))
+            .setColor(0x9b59b6)
+            .setFooter({ text: 'RailwayBot Monitor', iconURL: ICON_DARK })
+            .setTimestamp();
+
+        await channel.send({ embeds: [embed] });
+        storeDb.updateMonitoredServiceLogAlert(svc.id, new Date().toISOString());
+    } catch (err) {
+        logError(err as Error, { event: 'log_scan_failure', serviceId: svc.service_id });
+    }
+}
+
 async function processWebhook(body: WebhookBody) {
     if (body.type !== 'DEPLOY') return;
 
@@ -381,24 +586,23 @@ interface Project {
 
 
 process.on('uncaughtException', (err: unknown) => {
-    console.error('Fatal error (uncaughtException):', err);
-    void logError(err).finally(() => process.exit(1));
+    logError(err as Error, { event: 'uncaughtException' });
+    void logErrorToDiscord(`🚨 Uncaught Exception: ${formatErrorForDiscord(err as Error)}`).finally(() => process.exit(1));
 });
 
 process.on('unhandledRejection', (reason: unknown) => {
-    console.error('Unhandled rejection:', reason);
-    void logError(reason);
+    logError(reason as Error, { event: 'unhandledRejection' });
+    void logErrorToDiscord(`🚨 Unhandled Rejection: ${formatErrorForDiscord(reason as Error)}`);
 });
 
-async function logError(err: unknown) {
-    const message = formatError(err);
-    if (!client.isReady()) { console.error(message); return; }
+async function logErrorToDiscord(message: string) {
+    if (!client.isReady()) { logger.error(message); return; }
     try {
         const logChannel = await fetchTextChannel(LOG_CHANNEL_ID, 'LOG_CHANNEL');
-        await logChannel.send({ content: `**Fatal error experienced:**\n\`\`\`${message.slice(0, 1900)}\`\`\`` });
+        await logChannel.send({ content: message });
     } catch (channelError) {
-        console.error('Failed to report error to Discord:', channelError);
-        console.error(message);
+        logError(channelError as Error, { event: 'discord_log_failure' });
+        logger.error(message);
     }
 }
 

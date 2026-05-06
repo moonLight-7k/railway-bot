@@ -121,6 +121,42 @@ export async function registerCommands(client: Client, token: string, clientId: 
             .setDescription('Show Discord command help'),
 
         new SlashCommandBuilder()
+            .setName('monitor')
+            .setDescription('Manage runtime monitoring')
+            .addSubcommand(sub =>
+                sub
+                    .setName('add')
+                    .setDescription('Add a service to runtime monitoring')
+                    .addStringOption(opt =>
+                        opt.setName('project_id').setDescription('Railway project ID').setRequired(true)
+                    )
+                    .addStringOption(opt =>
+                        opt.setName('service_id').setDescription('Railway service ID').setRequired(true)
+                    )
+                    .addStringOption(opt =>
+                        opt.setName('environment_id').setDescription('Railway environment ID').setRequired(true)
+                    )
+                    .addStringOption(opt =>
+                        opt.setName('project_name').setDescription('Display name for the project (optional)')
+                    )
+                    .addStringOption(opt =>
+                        opt.setName('service_name').setDescription('Display name for the service (optional)')
+                    )
+                    .addStringOption(opt =>
+                        opt.setName('environment_name').setDescription('Display name for the environment (optional)')
+                    )
+            )
+            .addSubcommand(sub => sub.setName('list').setDescription('List all monitored services'))
+            .addSubcommand(sub =>
+                sub
+                    .setName('remove')
+                    .setDescription('Remove a service from monitoring')
+                    .addIntegerOption(opt =>
+                        opt.setName('id').setDescription('Monitor entry ID').setRequired(true)
+                    )
+            ),
+
+        new SlashCommandBuilder()
             .setName('route')
             .setDescription('Configure alert routing')
             .addSubcommand(sub =>
@@ -180,7 +216,7 @@ export function setupInteractions(client: Client) {
 async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
     const { commandName } = interaction;
 
-    const restrictedCommands = ['project', 'route'];
+    const restrictedCommands = ['project', 'route', 'monitor'];
     if (restrictedCommands.includes(commandName) && !hasPermission(interaction)) {
         await interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
         return;
@@ -193,6 +229,7 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
             case 'digest': await handleDigestCommand(interaction); break;
             case 'help': await handleHelpCommand(interaction); break;
             case 'route': await handleRouteCommand(interaction); break;
+            case 'monitor': await handleMonitorCommand(interaction); break;
         }
     } catch (err) {
         console.error('Command error:', err);
@@ -372,13 +409,22 @@ async function handleHelpCommand(interaction: ChatInputCommandInteraction) {
                 inline: false,
             },
             {
+                name: 'Monitoring',
+                value: [
+                    '`/monitor add <project_id> <service_id> <environment_id> [names...]`',
+                    '`/monitor list`',
+                    '`/monitor remove <id>`',
+                ].join('\n'),
+                inline: false,
+            },
+            {
                 name: 'Incident Buttons',
                 value: '`Acknowledge`, `Resolve`, `Info`, `Mute 1h`, `Mute 24h`',
                 inline: false,
             },
             {
                 name: 'Permissions',
-                value: '`/project *` and `/route *` require `Manage Channels`.',
+                value: '`/project *`, `/route *`, and `/monitor *` require `Manage Channels`.',
                 inline: false,
             },
         )
@@ -430,6 +476,68 @@ async function handleRouteCommand(interaction: ChatInputCommandInteraction) {
             const id = interaction.options.getInteger('id', true);
             store.db.deleteAlertRoute(id);
             await interaction.reply({ content: `\u{1F5D1}\uFE0F Route #${id} removed.`, ephemeral: true });
+            break;
+        }
+    }
+}
+
+async function handleMonitorCommand(interaction: ChatInputCommandInteraction) {
+    const sub = interaction.options.getSubcommand();
+
+    switch (sub) {
+        case 'add': {
+            const projectId = interaction.options.getString('project_id', true);
+            const serviceId = interaction.options.getString('service_id', true);
+            const environmentId = interaction.options.getString('environment_id', true);
+            const projectName = interaction.options.getString('project_name') ?? projectId;
+            const serviceName = interaction.options.getString('service_name') ?? serviceId;
+            const environmentName = interaction.options.getString('environment_name') ?? environmentId;
+
+            const changes = store.db.insertMonitoredService({
+                projectId,
+                projectName,
+                serviceId,
+                serviceName,
+                environmentId,
+                environmentName,
+                addedBy: interaction.user.id,
+            });
+
+            if (changes === 0) {
+                await interaction.reply({ content: `This service/environment combination is already being monitored.`, ephemeral: true });
+            } else {
+                await interaction.reply({ content: `\u{1F4E1} Now monitoring **${serviceName}** in **${environmentName}** (project: ${projectName}).`, ephemeral: true });
+            }
+            break;
+        }
+        case 'list': {
+            const services = store.db.listMonitoredServices();
+            if (services.length === 0) {
+                await interaction.reply({ content: 'No services are being monitored.', ephemeral: true });
+                return;
+            }
+
+            const embed = new EmbedBuilder()
+                .setTitle('\u{1F4E1} Monitored Services')
+                .setColor(0x9b59b6)
+                .setDescription(
+                    services.map(s => {
+                        const status = s.last_known_status ?? 'unknown';
+                        const lastCheck = s.last_checked_at
+                            ? `<t:${Math.floor(new Date(s.last_checked_at).getTime() / 1000)}:R>`
+                            : 'never';
+                        return `\`#${s.id}\` **${s.project_name} / ${s.service_name}** (${s.environment_name})\n   Status: ${status} | Last check: ${lastCheck}`;
+                    }).join('\n')
+                )
+                .setTimestamp();
+
+            await interaction.reply({ embeds: [embed], ephemeral: true });
+            break;
+        }
+        case 'remove': {
+            const id = interaction.options.getInteger('id', true);
+            store.db.deleteMonitoredService(id);
+            await interaction.reply({ content: `\u{1F5D1}\uFE0F Monitor entry #${id} removed.`, ephemeral: true });
             break;
         }
     }
